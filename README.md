@@ -98,6 +98,7 @@ gh variable set APERTURE_HOST --body ai     # your Aperture hostname
 | `APERTURE_HOST` | variable or secret | no | `ai` |
 | `TS_HOSTNAME` | variable | no | `ai-workflow` |
 | `TS_TAG` | variable | no | `tag:ai-workflow-machine` |
+| `WORKFLOW_PAT` | secret | only to let the agent edit `.github/workflows/` | — |
 
 If you change `TS_TAG`, change the policy and the OAuth client to match.
 
@@ -185,9 +186,25 @@ transcript. It exits `1` on `error_during_execution`, `error_max_turns`, or
 `error_max_budget_usd`.
 
 The commit step runs as `github-actions[bot]` under `!cancelled()`, so a failed
-run still commits its report. It uses the first line of the prompt as the
-commit subject. If the push is rejected, it rebases and tries again, up to
-three attempts in total.
+run still commits its report. It uses the first line of the prompt as the commit
+subject. If the push is rejected, it checks why: it rebases and retries, up to
+three attempts, only when the remote moved on. Any other rejection fails
+immediately with the remote's own message, because a rebase won't fix it.
+
+**`GITHUB_TOKEN` can never push changes under `.github/workflows/`.** There is no
+`workflows` key in the `permissions:` block, so no setting grants it — GitHub
+blocks it by design, because a token issued to a run could otherwise rewrite the
+automation that decides what runs with which secrets. The rejection arrives
+server-side, sometimes as a bare `Internal Server Error`. If the agent needs to
+edit workflow files, set `WORKFLOW_PAT` (a PAT with the `workflow` scope); it's
+wired into `actions/checkout`, which is the only place that matters, because
+checkout writes the credential into `.git/config` and every later git command
+inherits it. Otherwise keep workflow edits out of agent runs — the commit step
+detects this case and says so instead of retrying.
+
+**Pushes made with `GITHUB_TOKEN` don't trigger other workflows.** Deliberate, on
+GitHub's side, to stop recursive runs. If you want the agent's commit to kick off
+CI, push with a GitHub App installation token or a PAT instead.
 
 ## Security notes
 

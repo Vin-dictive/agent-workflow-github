@@ -54,6 +54,12 @@ jobs:
         with:
           # Full history so the agent can read `git log` and `git diff`.
           fetch-depth: 0
+          # checkout writes this credential into .git/config, and every later git
+          # command -- including the push below -- inherits it. Handing a token to
+          # the push step alone would do nothing. Set the WORKFLOW_PAT secret (a
+          # PAT with the `workflow` scope) if the agent needs to edit files under
+          # .github/workflows/; the default GITHUB_TOKEN can never push those.
+          token: ${{ secrets.WORKFLOW_PAT || github.token }}
 
       - name: Join the tailnet
         uses: tailscale/github-action@v4
@@ -155,14 +161,32 @@ jobs:
             -m "Agent status: $AGENT_STATUS" \
             -m "Run: $RUN_URL"
 
-          # Someone may have pushed while the agent was thinking.
+          # Retry only the one failure a retry can fix: someone pushed while the
+          # agent was thinking. Anything else is rejected for a standing reason,
+          # so rebasing three times just hides the real message.
+          err=$(mktemp)
           for attempt in 1 2 3; do
-            if git push origin "HEAD:$GITHUB_REF_NAME"; then
+            if git push origin "HEAD:$GITHUB_REF_NAME" 2>&1 | tee "$err"; then
               exit 0
             fi
-            echo "Push rejected (attempt $attempt), rebasing onto origin/$GITHUB_REF_NAME..."
-            git pull --rebase origin "$GITHUB_REF_NAME"
+
+            if grep -qiE 'fetch first|non-fast-forward|behind its remote|stale info' "$err"; then
+              echo "Remote moved on (attempt $attempt); rebasing onto origin/$GITHUB_REF_NAME..."
+              git pull --rebase origin "$GITHUB_REF_NAME"
+              continue
+            fi
+
+            echo "::error::Push rejected for a reason a rebase will not fix. See above."
+            if git show --name-only --format= HEAD | grep -q '^\.github/workflows/'; then
+              echo "::error::This commit changes .github/workflows/. The default GITHUB_TOKEN can"
+              echo "never push workflow files: there is no 'workflows' key in the permissions"
+              echo "block, so no setting grants it. GitHub rejects the push server-side, sometimes"
+              echo "as a bare 500. Either add a PAT with the 'workflow' scope as the WORKFLOW_PAT"
+              echo "secret (it is wired into actions/checkout above), or keep workflow edits out"
+              echo "of agent runs and apply them yourself."
+            fi
+            exit 1
           done
 
-          echo "::error::Could not push the agent's commit after 3 attempts."
+          echo "::error::Still behind the remote after 3 rebases; giving up."
           exit 1
