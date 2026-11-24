@@ -120,7 +120,7 @@ Go to **Actions → Claude Agent → Run workflow**. Some prompts to try:
 | Input | Default | Description |
 | --- | --- | --- |
 | `prompt` | _required_ | The task, in free form. The agent plans its own steps. |
-| `model` | `claude-opus-5-5` | Must be served by Aperture **and** match your grant's `models` glob. It's free text because only your gateway knows which models it serves. |
+| `model` | `anthropic/claude-haiku-4.5` | Must be served by Aperture **and** match your grant's `models` glob. It's free text because only your gateway knows which models it serves. |
 | `max_turns` | `25` | Hard cap on agentic turns. |
 | `commit` | `true` | Uncheck for a dry run: the agent still runs and reports, but nothing gets pushed. |
 

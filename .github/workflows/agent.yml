@@ -13,7 +13,7 @@ on:
       model:
         description: "Model ID. Must be in Aperture's provider `models` list and match your grant's glob."
         required: false
-        default: claude-opus-5-5
+        default: anthropic/claude-haiku-4.5
         type: string
       max_turns:
         description: "Hard cap on agentic turns"
