@@ -2,7 +2,9 @@
 
 This repo is a proof of concept: a manually-triggered GitHub Actions workflow
 runs a Claude Agent SDK application against the checkout, and the job commits
-and pushes whatever the agent changed.
+and pushes whatever the agent changed. The runner joins a Tailscale tailnet as
+an ephemeral tagged node and reaches Claude through a Tailscale Aperture
+gateway, so no Anthropic credential is stored in this repository.
 
 ## Layout
 
@@ -17,6 +19,8 @@ and pushes whatever the agent changed.
   don't reformat past reports.
 - Pass untrusted input (prompts, event payload fields) to workflow steps through
   `env:`, never interpolated into a `run:` string.
+- Aperture is reached over plain `http://` on the tailnet. Don't "fix" it to
+  `https://` — Aperture doesn't serve TLS there.
 - Keep `scripts/run_agent.py` dependency-free beyond `claude-agent-sdk` and the
   standard library.
 

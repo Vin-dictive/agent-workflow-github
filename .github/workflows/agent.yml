@@ -1,7 +1,8 @@
 name: Claude Agent
 
-# Manual-only. Give it a task, it edits the repo, the job commits and pushes
-# whatever changed back to the branch you launched it from.
+# Manual-only. The runner joins the tailnet as an ephemeral tagged node, reaches
+# Claude through the Aperture AI gateway (no Anthropic credential in this repo),
+# edits the checkout, then commits and pushes whatever changed.
 on:
   workflow_dispatch:
     inputs:
@@ -10,14 +11,10 @@ on:
         required: true
         type: string
       model:
-        description: "Model to run the agent with"
+        description: "Model ID. Must be in Aperture's provider `models` list and match your grant's glob."
         required: false
-        default: claude-opus-5
-        type: choice
-        options:
-          - claude-opus-5
-          - claude-sonnet-5
-          - claude-haiku-4-5
+        default: claude-opus-5-5
+        type: string
       max_turns:
         description: "Hard cap on agentic turns"
         required: false
@@ -30,6 +27,7 @@ on:
         type: boolean
 
 # Needed to push the agent's work back to the branch.
+# No `id-token: write`: that's only for Tailscale's federated OIDC auth, not an OAuth client.
 permissions:
   contents: write
 
@@ -37,6 +35,15 @@ permissions:
 concurrency:
   group: claude-agent-${{ github.ref }}
   cancel-in-progress: false
+
+env:
+  # Aperture's hostname on your tailnet. Set `APERTURE_HOST` as a repo variable
+  # (Settings -> Secrets and variables -> Actions -> Variables) or as a secret.
+  APERTURE_HOST: ${{ vars.APERTURE_HOST || secrets.APERTURE_HOST || 'ai' }}
+  # Device name and ACL tag for the ephemeral node. The tag must already exist in
+  # your tailnet's `tagOwners`, and the OAuth client must carry the same tag.
+  TS_HOSTNAME: ${{ vars.TS_HOSTNAME || 'ai-workflow' }}
+  TS_TAG: ${{ vars.TS_TAG || 'tag:ai-workflow' }}
 
 jobs:
   agent:
@@ -47,6 +54,48 @@ jobs:
         with:
           # Full history so the agent can read `git log` and `git diff`.
           fetch-depth: 0
+
+      - name: Join the tailnet
+        uses: tailscale/github-action@v4
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          tags: ${{ env.TS_TAG }}
+          hostname: ${{ env.TS_HOSTNAME }}
+          # Fails the job if Aperture isn't reachable, before we install anything.
+          ping: ${{ env.APERTURE_HOST }}
+
+      - name: Show what Aperture offers this node
+        continue-on-error: true
+        env:
+          AGENT_MODEL: ${{ inputs.model }}
+        run: |
+          set -uo pipefail
+          echo "Gateway: http://$APERTURE_HOST  (identity: $TS_TAG)"
+          if ! models=$(curl -fsS --max-time 15 "http://$APERTURE_HOST/v1/models"); then
+            echo "::warning::Could not list models from http://$APERTURE_HOST/v1/models."
+            echo "Reachability was already confirmed by tailscale ping, so this is most"
+            echo "likely a missing grant: 403 means no { \"role\": \"user\" } for $TS_TAG."
+            exit 0
+          fi
+          MODELS_JSON="$models" python3 - <<'PY'
+          import json, os
+          want = os.environ["AGENT_MODEL"]
+          try:
+              data = json.loads(os.environ["MODELS_JSON"])
+          except json.JSONDecodeError:
+              print("::warning::/v1/models did not return JSON; skipping the model check.")
+              raise SystemExit(0)
+          entries = data.get("data", data if isinstance(data, list) else [])
+          ids = sorted({m["id"] for m in entries if isinstance(m, dict) and m.get("id")})
+          print(f"Models available to this identity ({len(ids)}):")
+          for model_id in ids:
+              print(f"  - {model_id}")
+          # Aperture may report bare names or provider/model; accept either.
+          if ids and want not in ids and want not in {i.rsplit("/", 1)[-1] for i in ids}:
+              print(f"::warning::Requested model '{want}' is not in that list. Expect an "
+                    "HTTP 404 from Aperture unless it resolves as an alias.")
+          PY
 
       - uses: actions/setup-python@v7
         with:
@@ -60,9 +109,11 @@ jobs:
       - name: Run the agent
         id: agent
         env:
-          # Long-lived subscription token from `claude setup-token`.
-          # Swap for ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }} to bill the API instead.
-          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          # The only thing pointing Claude at Aperture. Aperture does a WhoIs on the
+          # source tailnet IP, matches the grant for TS_TAG, and injects the real
+          # Anthropic key upstream -- so there is no API key or OAuth token here.
+          # Must be http://, not https:// (Aperture serves plain HTTP on the tailnet).
+          ANTHROPIC_BASE_URL: http://${{ env.APERTURE_HOST }}
           # Inputs go through env, never into the `run:` string: a prompt containing
           # `$(...)` or backticks would otherwise execute on the runner.
           AGENT_PROMPT: ${{ inputs.prompt }}

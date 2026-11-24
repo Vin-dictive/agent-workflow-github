@@ -9,9 +9,11 @@ agent decides no source changes are needed.
 Committing and pushing is deliberately *not* done here. The GitHub Actions
 workflow owns that, which keeps the agent itself from pushing to the repo.
 
-Auth comes from the environment, in the order the bundled Claude Code binary
-resolves it:
+Auth comes from the environment. Three shapes work:
 
+* ``ANTHROPIC_BASE_URL`` - route through an LLM gateway such as Tailscale
+  Aperture, which resolves the caller's identity from the tailnet and injects
+  the real provider key. No credential lives in the repo at all.
 * ``CLAUDE_CODE_OAUTH_TOKEN`` - long-lived subscription token from
   ``claude setup-token``
 * ``ANTHROPIC_API_KEY`` - Claude API key
@@ -76,6 +78,11 @@ class Config:
     permission_mode: str
     report_dir: Path | None
     repo_root: Path
+    base_url: str | None = None
+
+    @property
+    def via_gateway(self) -> bool:
+        return self.base_url is not None
 
 
 @dataclass
@@ -172,10 +179,13 @@ def parse_args(argv: list[str] | None = None) -> Config:
         where = "--prompt" if args.prompt is not None else f"${args.prompt_env}"
         parser.error(f"no task given ({where} was empty)")
 
-    if not (os.environ.get("CLAUDE_CODE_OAUTH_TOKEN") or os.environ.get("ANTHROPIC_API_KEY")):
+    base_url = (os.environ.get("ANTHROPIC_BASE_URL") or "").strip() or None
+    has_credential = bool(os.environ.get("CLAUDE_CODE_OAUTH_TOKEN") or os.environ.get("ANTHROPIC_API_KEY"))
+    if not base_url and not has_credential:
         parser.error(
-            "no credentials found: set CLAUDE_CODE_OAUTH_TOKEN (from `claude setup-token`) "
-            "or ANTHROPIC_API_KEY in the environment"
+            "no way to reach Claude: set ANTHROPIC_BASE_URL to an LLM gateway "
+            "(e.g. http://ai for Tailscale Aperture), or set CLAUDE_CODE_OAUTH_TOKEN "
+            "(from `claude setup-token`) or ANTHROPIC_API_KEY"
         )
 
     repo_root = Path(__file__).resolve().parent.parent
@@ -187,7 +197,26 @@ def parse_args(argv: list[str] | None = None) -> Config:
         permission_mode=args.permission_mode,
         report_dir=(repo_root / args.report_dir) if args.report_dir else None,
         repo_root=repo_root,
+        base_url=base_url,
     )
+
+
+def gateway_env(cfg: Config) -> dict[str, str]:
+    """Extra environment for the Claude Code subprocess when routing via a gateway."""
+    if not cfg.via_gateway:
+        return {}
+    env = {
+        # Update checks, telemetry, and feature-flag fetches talk to
+        # api.anthropic.com directly and would bypass the gateway entirely.
+        "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
+    }
+    if not (os.environ.get("CLAUDE_CODE_OAUTH_TOKEN") or os.environ.get("ANTHROPIC_API_KEY")):
+        # Aperture derives the caller from the tailnet and injects the real
+        # provider key, so no client credential is needed -- but Claude Code
+        # still refuses to start with none at all. A dash is the placeholder
+        # Tailscale's own Claude Code and claude-code-action docs use.
+        env["ANTHROPIC_API_KEY"] = "-"
+    return env
 
 
 async def run_agent(cfg: Config) -> Outcome:
@@ -204,6 +233,7 @@ async def run_agent(cfg: Config) -> Outcome:
         # Load CLAUDE.md and .claude/settings.json from the checkout; ignore whatever
         # user-level config happens to exist on the runner.
         setting_sources=["project"],
+        env=gateway_env(cfg),
         stderr=lambda line: print(f"[cli] {line}", file=sys.stderr, flush=True),
     )
 
@@ -251,6 +281,7 @@ def build_report(cfg: Config, outcome: Outcome, changed: list[str], started_at: 
         ("Started", started_at.strftime("%Y-%m-%d %H:%M:%S UTC")),
         ("Status", f"`{status}`"),
         ("Model", f"`{cfg.model or 'default'}`"),
+        ("Endpoint", f"`{cfg.base_url}`" if cfg.via_gateway else "`api.anthropic.com`"),
         ("Turns", str(result.num_turns) if result else "n/a"),
         ("Duration", f"{result.duration_ms / 1000:.1f}s" if result else "n/a"),
         ("Cost", cost),
@@ -343,6 +374,7 @@ def main(argv: list[str] | None = None) -> int:
 
     log(f"Repo:   {cfg.repo_root}")
     log(f"Model:  {cfg.model or 'Claude Code default'}")
+    log(f"Via:    {cfg.base_url + ' (gateway)' if cfg.via_gateway else 'api.anthropic.com'}")
     log(f"Mode:   {cfg.permission_mode} (max {cfg.max_turns} turns)")
     log(f"Task:   {' '.join(cfg.prompt.split())[:200]}")
     log("-" * 72)
