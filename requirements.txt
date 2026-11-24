@@ -1,0 +1,4 @@
+# Claude Agent SDK for Python (Claude Code as a library).
+# Ships a native Claude Code binary in the platform wheel, so the runner needs
+# no separate `npm install -g @anthropic-ai/claude-code`.
+claude-agent-sdk>=0.2.188,<0.3

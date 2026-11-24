@@ -1,0 +1,117 @@
+name: Claude Agent
+
+# Manual-only. Give it a task, it edits the repo, the job commits and pushes
+# whatever changed back to the branch you launched it from.
+on:
+  workflow_dispatch:
+    inputs:
+      prompt:
+        description: "What should the agent do? It can read, write, and edit any file in the repo."
+        required: true
+        type: string
+      model:
+        description: "Model to run the agent with"
+        required: false
+        default: claude-opus-5
+        type: choice
+        options:
+          - claude-opus-5
+          - claude-sonnet-5
+          - claude-haiku-4-5
+      max_turns:
+        description: "Hard cap on agentic turns"
+        required: false
+        default: "25"
+        type: string
+      commit:
+        description: "Commit and push the agent's changes (uncheck for a dry run)"
+        required: false
+        default: true
+        type: boolean
+
+# Needed to push the agent's work back to the branch.
+permissions:
+  contents: write
+
+# Two agents editing the same branch would race on the push.
+concurrency:
+  group: claude-agent-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  agent:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # Full history so the agent can read `git log` and `git diff`.
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install the Agent SDK
+        run: pip install -r requirements.txt
+
+      - name: Run the agent
+        id: agent
+        env:
+          # Long-lived subscription token from `claude setup-token`.
+          # Swap for ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }} to bill the API instead.
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          # Inputs go through env, never into the `run:` string: a prompt containing
+          # `$(...)` or backticks would otherwise execute on the runner.
+          AGENT_PROMPT: ${{ inputs.prompt }}
+          AGENT_MODEL: ${{ inputs.model }}
+          AGENT_MAX_TURNS: ${{ inputs.max_turns }}
+          AGENT_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          python scripts/run_agent.py \
+            --prompt-env AGENT_PROMPT \
+            --model "$AGENT_MODEL" \
+            --max-turns "$AGENT_MAX_TURNS"
+
+      - name: Commit and push
+        # Runs even when the agent errored, so the failure report still lands in the repo.
+        if: ${{ !cancelled() && inputs.commit }}
+        env:
+          AGENT_PROMPT: ${{ inputs.prompt }}
+          AGENT_STATUS: ${{ steps.agent.outcome }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+
+          if git diff --cached --quiet; then
+            echo "Agent produced no changes; nothing to commit."
+            echo "_Agent produced no changes; nothing to commit._" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          # First line of the prompt, trimmed, as the commit subject. Quoted
+          # expansions only, so prompt text is never re-evaluated by the shell.
+          subject="${AGENT_PROMPT%%$'\n'*}"
+          git commit \
+            -m "agent: ${subject:0:68}" \
+            -m "$AGENT_PROMPT" \
+            -m "Agent status: $AGENT_STATUS" \
+            -m "Run: $RUN_URL"
+
+          # Someone may have pushed while the agent was thinking.
+          for attempt in 1 2 3; do
+            if git push origin "HEAD:$GITHUB_REF_NAME"; then
+              exit 0
+            fi
+            echo "Push rejected (attempt $attempt), rebasing onto origin/$GITHUB_REF_NAME..."
+            git pull --rebase origin "$GITHUB_REF_NAME"
+          done
+
+          echo "::error::Could not push the agent's commit after 3 attempts."
+          exit 1
