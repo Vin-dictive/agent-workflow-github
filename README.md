@@ -1,36 +1,53 @@
 # agent-workflow-github
 
-A GitHub Actions workflow that runs a Claude agent on your repo and commits the changes. Trigger it manually from the **Actions** tab, type a prompt, and watch the agent edit files and push the results.
+Run a Claude agent on this repository from the GitHub **Actions** tab. You type a
+prompt, the agent edits the checkout, and the workflow commits and pushes the
+result along with a Markdown report of the run.
 
-**Key design:**
-- **No Anthropic credential in this repo.** The runner joins your tailnet as an ephemeral node and talks to Claude through [Tailscale Aperture](https://tailscale.com/docs/aperture/what-is-aperture), which injects the real API key.
-- **The agent can only edit files.** It can't commit, push, reset, check out, or run `gh`—the workflow owns git history.
-- **Every run leaves a report** in `agent-runs/`, including failures.
+The repository stores no Anthropic credential. The runner joins your Tailscale
+tailnet as an ephemeral, tagged node and reaches Claude through a
+[Tailscale Aperture](https://tailscale.com/docs/aperture/what-is-aperture)
+gateway. Aperture identifies the node by its tag and injects the real API key
+upstream.
 
-This is a proof of concept. Read [Security notes](#security-notes) before you use it on anything sensitive.
+> **Proof of concept.** Read [Security](#security) before pointing it at
+> anything that matters.
 
-## How it works
+## At a glance
 
-1. You trigger the workflow from GitHub's Actions tab with a prompt.
-2. The job checks out your repo (full history, so the agent can read git log/diff).
-3. It joins your tailnet as an ephemeral node tagged `tag:ai-workflow-machine`.
-4. The agent SDK talks to Claude through Aperture at `http://<aperture-host>`.
-   - Aperture sees the source IP, looks up the tag, checks the grant, and injects your Anthropic API key.
-5. The agent reads and edits files in the checkout.
-6. The workflow commits and pushes changes (or skips the push if you unchecked `commit`).
-7. A Markdown report gets committed to `agent-runs/`.
+- **Manual trigger only** (`workflow_dispatch`), one run per branch at a time.
+- **The agent edits files; the workflow owns git.** `git commit`, `git push`,
+  `git reset`, `git checkout`, and `gh` are blocked for the agent.
+- **Every run leaves a report** in `agent-runs/`, including failed runs.
 
-**Key files:**
-- `.github/workflows/agent.yml` — the workflow
-- `scripts/run_agent.py` — the Agent SDK app; streams the loop, writes reports, exits non-zero on failure
-- `CLAUDE.md` — project-level guidance the agent reads on every run
-- `agent-runs/` — generated reports (don't hand-edit)
+| Path | What it is |
+| --- | --- |
+| `.github/workflows/agent.yml` | The workflow. |
+| `scripts/run_agent.py` | The Claude Agent SDK app. It streams the agent loop, writes the report, and exits non-zero if the run didn't finish cleanly. |
+| `CLAUDE.md` | Project guidance the agent loads on every run. |
+| `agent-runs/` | Generated run reports. Don't edit these by hand. |
+| `requirements.txt` | Its only dependency: `claude-agent-sdk`. |
+
+## How a run works
+
+1. You start **Actions → Claude Agent → Run workflow** and enter a prompt.
+2. The job checks out the repo with full history, so the agent can read `git log` and `git diff`.
+3. The Tailscale action joins the tailnet as `tag:ai-workflow-machine` and pings
+   Aperture. If Aperture can't be reached, the job fails at this step.
+4. An informational step lists the models Aperture offers this node. It warns
+   if the requested model isn't in that list.
+5. `run_agent.py` runs with `ANTHROPIC_BASE_URL=http://<aperture-host>`. Aperture
+   matches the node's tag to a grant and forwards the request with your key.
+6. The agent reads, edits, and runs commands in the checkout until it finishes
+   or reaches `max_turns`.
+7. The workflow commits everything as `github-actions[bot]`, including the
+   report, and pushes to the branch. It skips this step if you unchecked `commit`.
 
 ## Setup
 
-### 1. Tailscale policy: add a tag and a grant
+### 1. Add a tag and a grant to your Tailscale policy
 
-In the Tailscale admin console, edit the policy file. Replace `ai` with your Aperture hostname:
+Replace `ai` with your Aperture hostname:
 
 ```json
 {
@@ -53,60 +70,89 @@ In the Tailscale admin console, edit the policy file. Replace `ai` with your Ape
 }
 ```
 
-**Important:** Aperture needs *both* `role` and `models` in the capabilities. Without `role`, you'll get **403**. To limit CI to specific models, narrow the glob, e.g. `"anthropic/claude-opus-5-5"`. `src` must match exactly—globs like `tag:ai-*` won't work.
+- The grant must include both `role` and `models`. If `role` is missing,
+  Aperture returns **403**.
+- Narrow `models` to limit which models CI can use, for example `"anthropic/claude-haiku-4.5"`.
+- `src` must name the tag exactly. Globs such as `tag:ai-*` don't match.
 
 ### 2. Create a Tailscale OAuth client
 
-Go to **Settings → OAuth clients** in the admin console:
-- Scope: `auth_keys` (write)
-- Tag: `tag:ai-workflow-machine` (must match the tag in your policy)
+In the admin console, go to **Settings → OAuth clients** and create a client with:
 
-The workflow will create an ephemeral node with this tag and remove it when the job ends.
+- the **`auth_keys`** scope, with write access
+- the tag **`tag:ai-workflow-machine`**, the same tag as in the policy
 
-### 3. Set GitHub secrets and variables
+The workflow uses this client to create an ephemeral node, which is removed
+when the job ends.
+
+### 3. Add GitHub secrets and variables
 
 ```bash
 gh secret set TS_OAUTH_CLIENT_ID
 gh secret set TS_OAUTH_SECRET
-gh variable set APERTURE_HOST --body ai
+gh variable set APERTURE_HOST --body ai   # optional, defaults to "ai"
 ```
 
-| Name | Type | Required | Default |
+| Name | Kind | Default | Purpose |
 | --- | --- | --- | --- |
-| `TS_OAUTH_CLIENT_ID` | secret | ✓ | — |
-| `TS_OAUTH_SECRET` | secret | ✓ | — |
-| `APERTURE_HOST` | variable | | `ai` |
-| `TS_HOSTNAME` | variable | | `ai-workflow` |
-| `TS_TAG` | variable | | `tag:ai-workflow-machine` |
-| `WORKFLOW_PAT` | secret | only for `.github/workflows/` edits | — |
+| `TS_OAUTH_CLIENT_ID` | secret | — (required) | Tailscale OAuth client ID. |
+| `TS_OAUTH_SECRET` | secret | — (required) | Tailscale OAuth client secret. |
+| `APERTURE_HOST` | variable or secret | `ai` | Aperture's hostname on the tailnet. |
+| `TS_HOSTNAME` | variable | `ai-workflow` | Device name of the ephemeral node. |
+| `TS_TAG` | variable | `tag:ai-workflow-machine` | Tag for the node. If you change it, also change the policy and the OAuth client. |
+| `WORKFLOW_PAT` | secret | — | Optional PAT with the `workflow` scope. See [Pushing](#pushing). |
 
-**If you change `TS_TAG`**, update the policy and OAuth client tags to match.
+### 4. Put the workflow on the default branch
 
-### 4. Push the workflow to the default branch
-
-GitHub only shows `workflow_dispatch` workflows in the Actions tab once they're on the default branch.
+GitHub shows `workflow_dispatch` workflows in the Actions tab only after they
+are on the default branch.
 
 ### 5. Run it
 
-Go to **Actions → Claude Agent → Run workflow**. Try a prompt like:
+Go to **Actions → Claude Agent → Run workflow** and enter a prompt, for example:
+
 - `Write a REPORT.md explaining what this repo does.`
 - `Add type hints to scripts/run_agent.py.`
-- `Append a changelog entry for the last 10 commits.`
+- `Append a CHANGELOG entry covering the last 10 commits.`
 
 ## Workflow inputs
 
 | Input | Default | Description |
 | --- | --- | --- |
-| `prompt` | required | The task. The agent plans its own steps. |
-| `model` | `anthropic/claude-haiku-4.5` | Must be served by Aperture and match your grant's `models` glob. |
-| `max_turns` | `25` | Hard limit on agentic turns. |
-| `commit` | `true` | Uncheck for a dry run: the agent runs and reports, but doesn't push. |
+| `prompt` | required | The task. The agent decides its own steps. |
+| `model` | `anthropic/claude-haiku-4.5` | Model ID. Aperture must serve it, and it must match your grant's `models` glob. |
+| `max_turns` | `25` | Maximum number of agent turns. |
+| `commit` | `true` | Uncheck for a dry run. The agent still runs and the report appears in the job log, but nothing is pushed. |
 
-The job has a 30-minute timeout. Runs on the same branch are queued sequentially.
+The job times out after 30 minutes.
 
-## Running locally
+## The agent script
 
-If your machine is on the tailnet:
+`scripts/run_agent.py` configures the SDK as follows:
+
+- **Tools.** `Read`, `Write`, `Edit`, `Glob`, `Grep`, and `Bash` are
+  auto-approved under `acceptEdits`, because no one is present to approve
+  prompts. Git writes and `gh` are listed in `disallowed_tools`, so they are
+  denied in every permission mode.
+- **Settings.** `setting_sources=["project"]` loads `CLAUDE.md` and `.claude/`
+  from the checkout and ignores any user-level config on the runner.
+- **System prompt.** The script uses Claude Code's preset system prompt and
+  appends a note that the agent is running non-interactively in CI.
+- **Gateway mode.** When `ANTHROPIC_BASE_URL` is set, the script sets
+  `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1` so that update checks and
+  telemetry don't go around the gateway. If no credential is present, it sets
+  the placeholder `ANTHROPIC_API_KEY=-`, because Claude Code won't start without
+  a key. Aperture supplies the real one.
+
+The script streams the agent loop to stdout, so the Actions log reads as a
+transcript. The report contains the task, the agent's final message, changed
+files, cost, token usage, and a collapsed transcript. The script exits `1` on
+any result other than `success`, for example `error_max_turns`,
+`error_max_budget_usd`, or `error_during_execution`.
+
+### Running locally
+
+From a machine on the tailnet:
 
 ```bash
 python3 -m venv .venv && source .venv/bin/activate
@@ -115,64 +161,74 @@ export ANTHROPIC_BASE_URL=http://ai
 python scripts/run_agent.py --prompt "Summarize this repo in REPORT.md"
 ```
 
-Without Aperture, set `ANTHROPIC_API_KEY` or `CLAUDE_CODE_OAUTH_TOKEN` (from `claude setup-token`) instead of `ANTHROPIC_BASE_URL`. The script writes a report to `agent-runs/` and doesn't commit.
-
-**run_agent.py flags:**
+If you don't use Aperture, set `ANTHROPIC_API_KEY` or `CLAUDE_CODE_OAUTH_TOKEN`
+instead (get the token from `claude setup-token`). Run locally, the script
+writes a report but never commits.
 
 | Flag | Default | Description |
 | --- | --- | --- |
-| `--prompt TEXT` | — | The task, inline. |
-| `--prompt-env NAME` | `AGENT_PROMPT` | Read the task from this env var (CI uses this for shell safety). |
-| `--model ID` | `$AGENT_MODEL` or Claude Code's default | Model alias or full ID. |
-| `--max-turns N` | `25` | Hard limit on agentic turns. |
-| `--max-budget-usd X` | none | Stop when client-side cost reaches this. |
+| `--prompt TEXT` | — | The task, given inline. |
+| `--prompt-env NAME` | `AGENT_PROMPT` | Read the task from this env var. CI uses this to keep prompt text off the command line. |
+| `--model ID` | `$AGENT_MODEL`, else Claude Code's default | Model alias or full ID. |
+| `--max-turns N` | `25` | Maximum number of agent turns. |
+| `--max-budget-usd X` | none | Stop when the client-side cost estimate reaches this amount. |
 | `--permission-mode MODE` | `acceptEdits` | Claude Code permission mode. |
-| `--report-dir DIR` | `agent-runs` | Report output directory; pass `""` to skip. |
+| `--report-dir DIR` | `agent-runs` | Directory for the report. Pass `""` to skip writing one. |
 
-## How the script is configured
+## Pushing
 
-The Agent SDK is configured with:
+- **The commit step runs even when the agent fails.** The failure report still
+  reaches the repo. The commit subject is `agent: <first line of the prompt>`.
+  The body holds the full prompt, the agent's status, and the run URL.
+- **Retries cover only a moved remote.** If the push is rejected because the
+  remote has new commits, the step rebases and retries, up to three times. Any
+  other rejection fails immediately.
+- **Workflow files need a PAT.** `GITHUB_TOKEN` can never push changes under
+  `.github/workflows/`. To let the agent edit workflows, set `WORKFLOW_PAT` to
+  a PAT with the `workflow` scope. Checkout uses it for every later git
+  command. Without the PAT, the commit step detects this rejection and explains
+  it in the log.
+- **Pushes made with `GITHUB_TOKEN` don't trigger other workflows.** GitHub
+  blocks this to prevent recursion. To have the agent's commits start CI, push
+  with a PAT, such as `WORKFLOW_PAT`, or a GitHub App token.
 
-- **`permission_mode="acceptEdits"`** and an allowed-tools list (`Read`, `Write`, `Edit`, `Glob`, `Grep`, `Bash`). There's no human to approve prompts in CI.
-- **`disallowed_tools`** that block `git commit`, `git push`, `git reset`, `git checkout`, and `gh` in every permission mode.
-- **`setting_sources=["project"]`** so it loads `CLAUDE.md` and `.claude/` from the checkout, ignoring runner-level config.
-- **Gateway setup:** When `ANTHROPIC_BASE_URL` is set, the script sets `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1` to skip update checks and telemetry that would bypass the gateway. If no credential exists, it sets a placeholder; Aperture replaces it.
+## Security
 
-The script streams the loop to stdout (Actions logs are readable transcripts). It writes a Markdown report with the task, agent's message, changed files, cost, tokens, and a collapsed transcript. It exits `1` on `error_during_execution`, `error_max_turns`, or `error_max_budget_usd`.
-
-**Commits:** The job commits as `github-actions[bot]` even if the run fails (under `!cancelled()`). It uses the prompt's first line as the commit subject. On push rejection, it checks why: it rebases and retries (up to 3 times) only if the remote moved on; other rejections fail immediately.
-
-**Workflow edits:** `GITHUB_TOKEN` can't push to `.github/workflows/` by design—GitHub blocks it to prevent runs from rewriting themselves. If the agent needs to edit workflows, set `WORKFLOW_PAT` (with the `workflow` scope). Otherwise, the commit step detects this case and reports it instead of retrying.
-
-**Triggering CI:** Pushes with `GITHUB_TOKEN` don't trigger other workflows (by design, to stop recursion). Use a GitHub App token or PAT if you want the agent's commit to kick off CI.
-
-## Security notes
-
-- **Aperture is `http://` only.** The tailnet encrypts and authenticates the connection; Aperture doesn't serve TLS on the tailnet.
-- **Access is deny-by-default.** Grants only add access; there's no `deny` rule. To restrict access, edit or remove a grant.
-- **Prompt text is shell-safe.** All `${{ inputs.* }}` go through `env:`, not interpolated into `run:`. Prompt-embedded `$(...)` won't execute.
-- **The agent can run `Bash`.** It can't do git writes or `gh`, but that's still broad. To allow read-and-edit only, remove `Bash` from `DEFAULT_ALLOWED_TOOLS` in `scripts/run_agent.py`.
-- **Failed runs are committed.** A partial edit can land on the branch. Use a scratch branch, or replace the push step with a PR creation action (e.g., `peter-evans/create-pull-request`).
+- **Aperture uses plain `http://`.** The tailnet already encrypts and
+  authenticates the connection, and Aperture doesn't serve TLS there. Don't
+  change the URL to `https://`.
+- **Access is deny-by-default.** Grants can only add access, and there is no
+  deny rule. To revoke access, edit or remove the grant.
+- **Prompts can't inject shell commands.** Every `${{ inputs.* }}` reaches
+  steps through `env:`, never directly inside a `run:` script, so `$(...)` in a
+  prompt isn't executed.
+- **`Bash` gives the agent broad access.** Only git writes and `gh` are
+  blocked. For a read-and-edit-only agent, remove `Bash` from
+  `DEFAULT_ALLOWED_TOOLS` in `scripts/run_agent.py`.
+- **Partial edits can land on the branch.** Failed runs are committed too. Use
+  a scratch branch, or replace the push step with a pull-request action such
+  as `peter-evans/create-pull-request`.
 
 ## Troubleshooting
 
-| Problem | Cause |
+| Symptom | Likely cause |
 | --- | --- |
-| "Join the tailnet" fails on `ping` | Wrong `APERTURE_HOST`, OAuth client tag doesn't match `TS_TAG`, or grant missing `tcp:80`. |
-| **403** from Aperture | Grant missing `{ "role": "user" }`. Both `role` and `models` are required. |
-| **404** from Aperture | No `models` pattern matches the requested model, or no provider serves it. |
-| Agent's push didn't trigger CI | Expected with `GITHUB_TOKEN`. Use a GitHub App token or PAT to trigger downstream workflows. |
+| The **Join the tailnet** step fails on `ping` | `APERTURE_HOST` is wrong, the OAuth client's tag doesn't match `TS_TAG`, or the grant is missing `tcp:80`. |
+| **403** from Aperture | The grant is missing `{ "role": "user" }`. |
+| **404** from Aperture | No `models` pattern matches the requested model, or no provider serves it. Check the model list in the "Show what Aperture offers" step. |
+| Push rejected and the commit touches `.github/workflows/` | `GITHUB_TOKEN` can't push workflow files. Set `WORKFLOW_PAT`. |
+| The agent's push didn't trigger CI | Expected when pushing with `GITHUB_TOKEN`. Push with a PAT or a GitHub App token. |
 
-## Variations and optional setups
+## Variations
 
-**Federated OIDC instead of an OAuth secret:** Pass `audience: ${{ secrets.TS_AUDIENCE }}` to the Tailscale action in place of `oauth-secret`, and add `id-token: write` to the job's permissions.
+- **Federated OIDC instead of an OAuth secret.** Pass `audience:` to the
+  Tailscale action in place of `oauth-secret`, and add `id-token: write` to the
+  workflow's `permissions`.
+- **No SDK wheel for your runner's platform.** Install Claude Code natively.
+  The SDK finds it on `PATH`.
 
-**No SDK wheel on your platform (e.g., ARM64):** Install Claude Code natively. The SDK finds it on `PATH`.
-
-**GitHub App token instead of GITHUB_TOKEN:** Replace `token: ${{ secrets.GITHUB_TOKEN }}` in `actions/checkout` with `token: ${{ secrets.GITHUB_APP_TOKEN }}` to trigger downstream workflows on the agent's push. See GitHub's docs on creating app tokens.
-
-## Learn more
+## Further reading
 
 - **Aperture:** [What it is](https://tailscale.com/docs/aperture/what-is-aperture) · [How it works](https://tailscale.com/docs/aperture/how-aperture-works) · [Get started](https://tailscale.com/docs/aperture/get-started) · [Grants](https://tailscale.com/docs/aperture/how-grants-work)
-- **Aperture + Anthropic:** [Setup](https://tailscale.com/docs/aperture/how-to/use-anthropic) · [Claude Code](https://tailscale.com/docs/aperture/how-to/use-claude-code) · [GitHub Action](https://tailscale.com/docs/aperture/how-to/use-claude-code-action)
+- **Aperture with Anthropic:** [Setup](https://tailscale.com/docs/aperture/how-to/use-anthropic) · [Claude Code](https://tailscale.com/docs/aperture/how-to/use-claude-code) · [GitHub Action](https://tailscale.com/docs/aperture/how-to/use-claude-code-action)
 - **Tools:** [Tailscale GitHub Action](https://tailscale.com/kb/1276/tailscale-github-action) · [Claude Agent SDK](https://code.claude.com/docs/en/agent-sdk/python) · [Claude Code env vars](https://code.claude.com/docs/en/env-vars)
