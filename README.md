@@ -12,10 +12,10 @@ injects the real provider key upstream.
 ```
 workflow_dispatch(prompt)
   └─ checkout (full history)
-     └─ tailscale/github-action  ──> ephemeral node "ai-workflow", tag:ai-workflow
+     └─ tailscale/github-action  ──> ephemeral node "ai-workflow", tag:ai-workflow-machine
         └─ pip install claude-agent-sdk
            └─ scripts/run_agent.py   ANTHROPIC_BASE_URL=http://ai
-              │                      └─ Aperture: WhoIs(src IP) -> tag:ai-workflow
+              │                      └─ Aperture: WhoIs(src IP) -> tag:ai-workflow-machine
               │                         -> grant match -> injects Anthropic key
               └─ edits files, writes agent-runs/<ts>-<run>.md
                  └─ git commit && git push   (the workflow, never the agent)
@@ -31,7 +31,7 @@ forged header buys nothing.
 
 A tagged node has no user account, so Aperture builds a synthetic identity from
 its tags: it sorts them alphabetically and joins them with commas. Our runner
-carries exactly one tag, so it shows up as `tag:ai-workflow`.
+carries exactly one tag, so it shows up as `tag:ai-workflow-machine`.
 
 Access is **deny-by-default** and grants are **purely additive** — there is no
 `deny` rule, so tightening access means editing or removing a grant. Network
@@ -61,11 +61,11 @@ In the Tailscale admin console policy file:
 ```json
 {
   "tagOwners": {
-    "tag:ai-workflow": []
+    "tag:ai-workflow-machine": []
   },
   "grants": [
     {
-      "src": ["tag:ai-workflow"],
+      "src": ["tag:ai-workflow-machine"],
       "dst": ["ai"],
       "ip": ["tcp:80"],
       "app": {
@@ -91,7 +91,7 @@ apply immediately.
 
 Admin console → **Settings → OAuth clients**. It needs the **`auth_keys`** write
 scope, and **every tag on the client must match the tags the workflow requests**.
-Tag it `tag:ai-workflow`.
+Tag it `tag:ai-workflow-machine`.
 
 Nodes created through OAuth are ephemeral: the action logs the node out as soon
 as the job finishes and the coordination server deletes it.
@@ -110,7 +110,7 @@ gh variable set APERTURE_HOST --body ai      # your Aperture hostname
 | `TS_OAUTH_SECRET` | secret | yes | — |
 | `APERTURE_HOST` | variable **or** secret | no | `ai` |
 | `TS_HOSTNAME` | variable | no | `ai-workflow` |
-| `TS_TAG` | variable | no | `tag:ai-workflow` |
+| `TS_TAG` | variable | no | `tag:ai-workflow-machine` |
 
 `APERTURE_HOST` is read as `vars.APERTURE_HOST || secrets.APERTURE_HOST || 'ai'`,
 so either kind works.

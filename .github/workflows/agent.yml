@@ -43,7 +43,7 @@ env:
   # Device name and ACL tag for the ephemeral node. The tag must already exist in
   # your tailnet's `tagOwners`, and the OAuth client must carry the same tag.
   TS_HOSTNAME: ${{ vars.TS_HOSTNAME || 'ai-workflow' }}
-  TS_TAG: ${{ vars.TS_TAG || 'tag:ai-workflow' }}
+  TS_TAG: ${{ vars.TS_TAG || 'tag:ai-workflow-machine' }}
 
 jobs:
   agent:
